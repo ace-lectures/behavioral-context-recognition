@@ -1,0 +1,54 @@
+---
+title: "Introduction à la reconnaissance de contexte "
+output: html_notebook
+---
+
+```{r warning=FALSE}
+library(plyr)
+library(readr)
+library(tidyverse)
+library(knitr)
+```
+
+# Analyse du jeux de données
+
+```{r message=FALSE, warning=FALSE}
+load_complete_dataset <- function() {
+  files_path <- file.path("_datasets", "ExtraSensory", 
+                          fsep = .Platform$file.sep)
+  files <- list.files(path=files_path, pattern="*.csv", 
+                      full.names=TRUE)
+  ldply(files, read_csv)
+}
+dataset <- load_complete_dataset()
+```
+
+  - Le jeux de données `dataset` contient `r prettyNum(nrow(dataset), big.mark=",")` observations sur `r length(dataset)` variables.
+
+```{r}
+labels <- dataset %>% select(starts_with("label:"))
+```
+
+  - Parmi ces variables, `r length(labels)` sont des étiquettes de reconnaissance de contexte
+
+```{r}
+plot_labels_count <- function (data) {
+  transposed <- rownames_to_column(data.frame(t(data)))
+  names(transposed) <- c("variable", "n")
+  ggplot(data=transposed, mapping=aes(x=variable, y=n)) + 
+    geom_bar(stat = "identity") +
+    coord_flip() 
+}
+plot_labels_count(data.frame(as.list(colSums(labels, na.rm = TRUE))))
+```
+
+
+# Annexes
+
+
+
+```{r warning=FALSE}
+kable(colSums(labels, na.rm = TRUE), label = "Nombre observations pour chaque étiquettes")
+```
+  
+  
