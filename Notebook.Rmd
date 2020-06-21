@@ -3,11 +3,16 @@ title: "Introduction à la reconnaissance de contexte "
 output: html_notebook
 ---
 
-```{r warning=FALSE}
+```{r warning=FALSE, error=FALSE}
 library(plyr)
 library(readr)
 library(tidyverse)
 library(knitr)
+
+library(devtools)
+if (!requireNamespace("ComplexHeatmap", quietly=TRUE))
+  install_github("jokergoo/ComplexHeatmap")
+suppressPackageStartupMessages(library(ComplexHeatmap))
 ```
 
 # Analyse du jeux de données
@@ -42,13 +47,68 @@ plot_labels_count <- function (data) {
 plot_labels_count(data.frame(as.list(colSums(labels, na.rm = TRUE))))
 ```
 
+# Classification de la localisation du téléphone 
+
+```{r}
+phone_labels <- labels %>% select(starts_with("label:PHONE_"))
+phone_labels <- phone_labels[complete.cases(phone_labels),]
+```
+
+On s'interesse ici uniquement aux observations de la localisation du téléphone de l'utilisateur. On dispose de `r prettyNum(nrow(phone_labels),big.mark=",")` observations. Dans un premier temps, on vérifie que toutes les observations sont bien disjointes.
+
+```{r}
+phone_labels_cases <- list(
+  "bag"    = rownames(phone_labels[phone_labels$'label:PHONE_IN_BAG' == 1,]),
+  "hand"   = rownames(phone_labels[phone_labels$'label:PHONE_IN_HAND' == 1,]),
+  "pocket" = rownames(phone_labels[phone_labels$'label:PHONE_IN_POCKET' == 1,]),
+  "table"  = rownames(phone_labels[phone_labels$'label:PHONE_ON_TABLE' == 1,])
+)
+phone_labels_matrix = make_comb_mat(phone_labels_cases)
+```
+
+```{r echo=FALSE}
+UpSet(phone_labels_matrix, 
+      set_order = order(set_size(phone_labels_matrix)),
+      row_title = "|conflict|",
+      right_annotation = upset_right_annotation(phone_labels_matrix, ylim = c(0, 70000)),
+      top_annotation = upset_top_annotation(phone_labels_matrix, ylim=c(0,70000)))
+```
+
+## Préparation du jeu de données
+
+On va maintenant fabriquer le jeu de données qui va nous permettre de faire l'experience de classification. On va réduire le jeu de données initial aux valeurs pour l'accéléromètre, le gyroscope et le magnétomètre.
+  
+```{r}
+phone_observations <- dataset %>% select(starts_with("raw_acc"),
+                                         starts_with("proc_gyro"),
+                                         starts_with("raw_magnet"),
+                                         starts_with("label:PHONE_"))
+phone_observations <- phone_observations[complete.cases(phone_observations),]
+```
+
+En restreignant uniquement aux cas où nous disposons de toutes les valeurs pour chaque observations, cela donne `r prettyNum(nrow(phone_observations), big.marg=",")` observations. 
+
+Plutot que $4$ colonnes indiquant $0$ ou $1$ pour chaque classe, les algorithmes d'apprentissage attendent une colonne contenant directement la classe qui nous interesse (sous la forme d'un _facteur_).
+
+```{r}
+phone_observations$STATUS <- "?"
+phone_observations[phone_observations$`label:PHONE_IN_BAG` == 1,]$STATUS    <- "B"
+phone_observations[phone_observations$`label:PHONE_IN_POCKET` == 1,]$STATUS <- "P"
+phone_observations[phone_observations$`label:PHONE_IN_HAND` == 1,]$STATUS   <- "H"
+phone_observations[phone_observations$`label:PHONE_ON_TABLE` == 1,]$STATUS  <- "T"
+phone_observations <- phone_observations %>% select(-starts_with("label:PHONE_"))
+```
+
 
 # Annexes
 
 
 
-```{r warning=FALSE}
-kable(colSums(labels, na.rm = TRUE), label = "Nombre observations pour chaque étiquettes")
+```{r warning=FALSE, error=FALSE}
+col_sums <- rownames_to_column(data.frame(colSums(labels, na.rm = TRUE)))
+names(col_sums) <- c("label", "count")
+col_sums <- col_sums[order(col_sums$count),]
+kable(col_sums, label = "Nombre observations pour chaque étiquettes")
 ```
   
   
