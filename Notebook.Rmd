@@ -1,9 +1,11 @@
 ---
-title: "Introduction à la reconnaissance de contexte "
-output: html_notebook
+title: 'Introduction à la reconnaissance de contexte '
+output:
+  pdf_document: default
+  html_notebook: default
 ---
 
-```{r warning=FALSE, error=FALSE}
+```{r warning=FALSE, error=FALSE, echo=FALSE}
 library(plyr)
 library(readr)
 library(tidyverse)
@@ -69,7 +71,7 @@ phone_labels_matrix = make_comb_mat(phone_labels_cases)
 ```{r echo=FALSE}
 UpSet(phone_labels_matrix, 
       set_order = order(set_size(phone_labels_matrix)),
-      row_title = "|conflict|",
+      row_title = "|observation|",
       right_annotation = upset_right_annotation(phone_labels_matrix, ylim = c(0, 70000)),
       top_annotation = upset_top_annotation(phone_labels_matrix, ylim=c(0,70000)))
 ```
@@ -96,19 +98,312 @@ phone_observations[phone_observations$`label:PHONE_IN_BAG` == 1,]$STATUS    <- "
 phone_observations[phone_observations$`label:PHONE_IN_POCKET` == 1,]$STATUS <- "P"
 phone_observations[phone_observations$`label:PHONE_IN_HAND` == 1,]$STATUS   <- "H"
 phone_observations[phone_observations$`label:PHONE_ON_TABLE` == 1,]$STATUS  <- "T"
+phone_observations$STATUS <- factor(phone_observations$STATUS, 
+                                    levels = c("B", "P", "H", "T"),
+                                    labels = c("bag", "pocket", "hand", "table"))
 phone_observations <- phone_observations %>% select(-starts_with("label:PHONE_"))
 ```
 
+Les donnés de chaque capteurs sont des des intervales très différents les uns des autres. 
 
-# Annexes
-
-
-
-```{r warning=FALSE, error=FALSE}
-col_sums <- rownames_to_column(data.frame(colSums(labels, na.rm = TRUE)))
-names(col_sums) <- c("label", "count")
-col_sums <- col_sums[order(col_sums$count),]
-kable(col_sums, label = "Nombre observations pour chaque étiquettes")
+```{r}
+summary(phone_observations[c("raw_acc:3d:mean_x", "raw_acc:3d:mean_y", "raw_acc:3d:mean_z")])
 ```
-  
+
+On va donc normaliser les données, pour ramener tous les calculs sur des intervalles dans `[0,1]`. On utilise une formule classique de normalisation : 
+
+```{r}
+normalize <- function (v) { return ((v - min(v)) / (max(v) - min(v))) }
+```
+
+On peut maintenant fabriquer le jeux de donnée normalisée : 
+
+```{r}
+obs_n <- as.data.frame(lapply(phone_observations[1:83],normalize))
+obs_n$status <- phone_observations$STATUS
+```
+
+## Un premier prédicteur simple avec la méthode des _k_ plus proche voisins.
+
+Pour commencer, on va naivement utiliser la méthode des _k_ plus proches voisins (_k nearest neighbors_, _k-NN_), qui est une des méthode les plus simples d'apprenitssage machine. L'idée générale de cette méthode est, pour une entrée inconnue _x_ à classifier, de lui donner la classe _C_ qui correspond à la classe la plus représentée parmi les entrées voisine fournie lors de la phase d'entrainement.
+
+### Fabrication des jeux de données d'entrainement et de test
+
+On va entrainer notre classifieur sur 80% des données disponibles. Et on utilisera les 20% restantes pour vérifier les résultats et mesurer à quel point notre classifieur est pertinent.
+
+```{r}
+set.seed(42) # Pour rendre les experiences reproductibles
+knn_training <- obs_n %>% sample_n(size = 0.8*nrow(obs_n))
+knn_test     <- setdiff(obs_n, knn_training)
+```
+
+### Entrainement du modèle
+
+```{r}
+library(class)
+knn_training_data <- knn_training %>% select(-status)
+knn_training_classes <- knn_training %>% select(status)
+knn_test_data <- knn_test %>% select(-status)
+
+knn_predictions <- knn(train = knn_training_data,
+                       test  = knn_test_data,
+                       cl    = knn_training_classes[,1],
+                       k     = 42)
+```
+
+### Évaluation des performances du modèle
+
+On affiche la matrice de confusion de la prédiction faite.
+
+```{r}
+knn_test_classes <- knn_test %>% select(status)
+library(caret)
+confusionMatrix(knn_test_classes[,1], knn_predictions)
+```
+
+On est rendu à 78% de précision (_accuracy_) !! Cela semble vraiment bien ! 
+
+On peut regarder un peu plus dans le détail les résultats pour s'en convaincre (ou pas ...)
+
+```{r}
+library(gmodels)
+CrossTable(x = knn_test_classes[,1], y = knn_predictions,
+           prop.chisq=FALSE, prop.r = FALSE, 
+           prop.c = FALSE, prop.t = FALSE)
+```
+
+Le jeu d'entrainement étant déséquilibré, les reconnaissance du contexte "le téléphone est sur la table" ont complètement déséquilibré la prédiction, tout en maintenant une précision de presque 80%. 
+
+**Il faut faire très attention aux données selectionnées pour l'entraînement, car on risque d'introduire ce genre de biais, même inconsciemment**
+
+## K-plus proche voisins, deuxième !
+
+On commence par rééquilibrer le jeu de donnée
+
+```{r}
+summary(obs_n$status)
+```
+
+On a environ $6,000$ observations pour `bag`, `pocket` et `hand`, mais plus de `40,000` pour `table`. On va "oublier" des observations pour `table`, pour rebalancer le jeux de données.
+
+```{r}
+obs_n_balanced <- obs_n[obs_n$status == 'bag',]
+obs_n_balanced <- rbind(obs_n_balanced,  obs_n[obs_n$status == 'pocket',])
+obs_n_balanced <- rbind(obs_n_balanced,  obs_n[obs_n$status == 'hand',])
+obs_n_balanced <- rbind(obs_n_balanced,  sample_n(obs_n[obs_n$status == 'table',], 6000))
+```
+
+On relance l'entrainemment, puis la validation du modèle.
+
+```{r}
+knn_training_2 <- obs_n_balanced %>% sample_n(size = 0.8*nrow(obs_n_balanced))
+knn_test_2     <- setdiff(obs_n_balanced, knn_training_2)
+knn_training_data_2 <- knn_training_2 %>% select(-status)
+knn_training_classes_2 <- knn_training_2 %>% select(status)
+knn_test_data_2 <- knn_test_2 %>% select(-status)
+
+knn_predictions_2 <- knn(train = knn_training_data_2,
+                       test  = knn_test_data_2,
+                       cl    = knn_training_classes_2[,1],
+                       k     = 42)
+knn_test_classes_2 <- knn_test_2 %>% select(status)
+confusionMatrix(knn_test_classes_2[,1], knn_predictions_2)
+CrossTable(x = knn_test_classes_2[,1], y = knn_predictions_2,
+           prop.chisq=FALSE, prop.r = FALSE, 
+           prop.c = FALSE, prop.t = FALSE)
+```
+
+C'est pas vraiment mieux en fait ... pourtant équilibrer le jeux de données semblait naturel. 
+
+## K-plus proche voisins, troisième !
+
+La normalisation dans [0,1] avec notre formule "naive" a pour effet de bord d'écraser des valeurs extrêmes, ce qui les a rapprochées trop naivement de leurs voisines. On peut utiliser une méthode alternative (_z-score_), qui n'a ni minimum ni maximum prédéfinis.
+
+```{r}
+obs_n_z <- as.data.frame(scale(phone_observations[1:83]))
+obs_n_z$status <- phone_observations$STATUS
+```
+
+On relance alors la fabrication du jeu de données, l'entrainement du prédicteur et la validiation de la performance.
+
+```{r}
+obs_n_balanced_3 <- obs_n_z[obs_n_z$status == 'bag',]
+obs_n_balanced_3 <- rbind(obs_n_balanced_3,  obs_n_z[obs_n_z$status == 'pocket',])
+obs_n_balanced_3 <- rbind(obs_n_balanced_3,  obs_n_z[obs_n_z$status == 'hand',])
+obs_n_balanced_3 <- rbind(obs_n_balanced_3,  sample_n(obs_n_z[obs_n_z$status == 'table',], 6000))
+
+knn_training_3 <- obs_n_balanced_3 %>% sample_n(size = 0.8*nrow(obs_n_balanced_3))
+knn_test_3     <- setdiff(obs_n_balanced_3, knn_training_3)
+knn_training_data_3 <- knn_training_3 %>% select(-status)
+knn_training_classes_3 <- knn_training_3 %>% select(status)
+knn_test_data_3 <- knn_test_3 %>% select(-status)
+
+knn_predictions_3 <- knn(train = knn_training_data_3,
+                       test  = knn_test_data_3,
+                       cl    = knn_training_classes_3[,1],
+                       k     = 42)
+knn_test_classes_3 <- knn_test_3 %>% select(status)
+confusionMatrix(knn_test_classes_3[,1], knn_predictions_3)
+CrossTable(x = knn_test_classes_3[,1], y = knn_predictions_3,
+           prop.chisq=FALSE, prop.r = FALSE, 
+           prop.c = FALSE, prop.t = FALSE)
+```
+
+globalement, on n'est pas vraiment bon ...
+
+##  Et si le problème, c'était les donnés ?
+
+On a mesuré beaucoup trop de variables pour chaque observations. Cela ajoute du bruit, et rend le prédicteur fragile. On va s'interesser à la corrélation entre les variables pour mesurer ça.
+
+```{r}
+library(corrplot)
+corr_obs <- phone_observations %>% select(-STATUS)
+colnames(corr_obs) <- 1:83
+corr_matrix <- cor(corr_obs)
+corrplot(corr_matrix, type = "upper", 
+         tl.col = "black", tl.srt = 45, tl.cex=0.5)
+```
+
+On va s'interesser a nettoayer le jeux de données, pour retirer les variables ayant plus de 80% de corrélation avec les autres.
+
+```{r}
+corr_obs <- phone_observations %>% select(-STATUS)
+corr_matrix <- cor(corr_obs)
+high <- findCorrelation(corr_matrix, cutoff = 0.8)
+phone_obs_tailored <- phone_observations[,-c(high)]
+tmp <- phone_obs_tailored %>% select(-STATUS)
+colnames(tmp) <- 1:ncol(tmp)
+corr_matrix_2 <- cor(tmp)
+corrplot(corr_matrix_2, type = "upper", 
+          tl.col = "black", tl.srt = 45, tl.cex=0.5)
+
+```
+
+On refait une tentative d'entrainemment sur le jeu de données maintenant qu'il contient moins de données corélées.
+
+```{r}
+obs_n_z_4 <- as.data.frame(scale(phone_obs_tailored[1:ncol(phone_obs_tailored)-1]))
+obs_n_z_4$status <- phone_obs_tailored$STATUS
+obs_n_balanced_4 <- obs_n_z_4[obs_n_z_4$status == 'bag',]
+obs_n_balanced_4 <- rbind(obs_n_balanced_4,  obs_n_z_4[obs_n_z_4$status == 'pocket',])
+obs_n_balanced_4 <- rbind(obs_n_balanced_4,  obs_n_z_4[obs_n_z_4$status == 'hand',])
+obs_n_balanced_4 <- rbind(obs_n_balanced_4,  sample_n(obs_n_z_4[obs_n_z_4$status == 'table',], 6000))
+
+knn_training_4 <- obs_n_balanced_4 %>% sample_n(size = 0.8*nrow(obs_n_balanced_4))
+knn_test_4     <- setdiff(obs_n_balanced_4, knn_training_4)
+knn_training_data_4 <- knn_training_4 %>% select(-status)
+knn_training_classes_4 <- knn_training_4 %>% select(status)
+knn_test_data_4 <- knn_test_4 %>% select(-status)
+
+knn_predictions_4 <- knn(train = knn_training_data_4,
+                       test  = knn_test_data_4,
+                       cl    = knn_training_classes_4[,1],
+                       k     = 42)
+knn_test_classes_4 <- knn_test_4 %>% select(status)
+confusionMatrix(knn_test_classes_4[,1], knn_predictions_4)
+CrossTable(x = knn_test_classes_4[,1], y = knn_predictions_4,
+           prop.chisq=FALSE, prop.r = FALSE, 
+           prop.c = FALSE, prop.t = FALSE)
+```
+
+## Et si le problème, c'était la méthode ?
+
+La méthode des plus proche voisins est simple, mais a pour inconvénient d'être très fragile aux variables bruitées et à la taille des jeux de données. De plus, elle demande enormément de puissance de calcul.
+
+On va s'interesser ici à la mise en place d'un arbre de décision, en utilisant l'algorithme `C5.0`.
+
+```{r}
+dt_obs_n_z <- as.data.frame(scale(phone_obs_tailored[1:ncol(phone_obs_tailored)-1]))
+dt_obs_n_z$status <- phone_obs_tailored$STATUS
+dt_obs_n_balanced <- dt_obs_n_z[dt_obs_n_z$status == 'bag',]
+dt_obs_n_balanced <- rbind(dt_obs_n_balanced,  dt_obs_n_z[dt_obs_n_z$status == 'pocket',])
+dt_obs_n_balanced <- rbind(dt_obs_n_balanced,  dt_obs_n_z[dt_obs_n_z$status == 'hand',])
+dt_obs_n_balanced <- rbind(dt_obs_n_balanced,  sample_n(dt_obs_n_z[dt_obs_n_z$status == 'table',], 6000))
+
+dt_training <- dt_obs_n_balanced %>% sample_n(size = 0.8*nrow(dt_obs_n_balanced))
+dt_test     <- setdiff(dt_obs_n_balanced, dt_training)
+dt_training_data <- dt_training %>% select(-status)
+dt_training_classes <- dt_training %>% select(status)
+dt_test_data <- dt_test %>% select(-status)
+```
+
+On vérifie qu'on a pas déséquilibré le jeu d'entrainement et celui de validation : 
+
+```{r}
+summary(dt_training$status)
+summary(dt_test$status)
+```
+
+```{r}
+library(C50)
+# On fabrique le prédicteur
+dt_model <- C5.0(dt_training_data,
+                 dt_training_classes[,1],
+                 trials = 1)
+# On l'applique au jeux de données de test
+dt_predictions <- predict(dt_model, dt_test_data, type = "class")
+# On vérifie les performances
+dt_test_classes <- dt_test %>% select(status)
+confusionMatrix(reference = dt_test_classes[,1], data = dt_predictions)
+CrossTable(x = dt_test_classes[,1], y = dt_predictions,
+           prop.chisq=FALSE, prop.r = FALSE, 
+           prop.c = FALSE, prop.t = FALSE)
+
+```
+
+Cela semble beaucoup mieux adapté à notre reconnaissance de contexte ! On se trompe beaucoup moins !
+
+### Utilisation d'_Adaptive Boosting_ pour améliorer l'arbre
+
+```{r}
+# On fabrique le prédicteur
+dt_model_adaboost <- C5.0(dt_training_data,
+                 dt_training_classes[,1],
+                 trials = 10)
+# On l'applique au jeux de données de test
+dt_predictions_adaboost <- predict(dt_model_adaboost, dt_test_data, type = "class")
+# On vérifie les performances
+confusionMatrix(reference = dt_test_classes[,1], data = dt_predictions_adaboost)
+CrossTable(y = dt_test_classes[,1], x = dt_predictions_adaboost,
+           prop.chisq=FALSE, prop.r = FALSE, 
+           prop.c = FALSE, prop.t = FALSE)
+
+```
+
+## Et si on utilisait un réseau de neurones ?
+
+Après tout, c'est à la mode, et tout le monde en parle. 
+
+Contrairement aux arbres de décisions qui sont _explicable_ (i.e., on peut regarder l'arbre et voir quelles variables influence la décision), les réseaux de neurones sont des boites noires.
+
+```{r}
+library(neuralnet)
+dt_obs_n_z <- as.data.frame(scale(phone_obs_tailored[1:ncol(phone_obs_tailored)-1]))
+dt_obs_n_z$status <- phone_obs_tailored$STATUS
+dt_obs_n_balanced <- dt_obs_n_z[dt_obs_n_z$status == 'bag',]
+dt_obs_n_balanced <- rbind(dt_obs_n_balanced,  dt_obs_n_z[dt_obs_n_z$status == 'pocket',])
+dt_obs_n_balanced <- rbind(dt_obs_n_balanced,  dt_obs_n_z[dt_obs_n_z$status == 'hand',])
+dt_obs_n_balanced <- rbind(dt_obs_n_balanced,  sample_n(dt_obs_n_z[dt_obs_n_z$status == 'table',], 6000))
+
+dt_training <- dt_obs_n_balanced %>% sample_n(size = 0.8*nrow(dt_obs_n_balanced))
+dt_test     <- setdiff(dt_obs_n_balanced, dt_training)
+dt_training_data <- dt_training %>% select(-status)
+dt_training_classes <- dt_training %>% select(status)
+dt_test_data <- dt_test %>% select(-status)
+
+
+```
+
+## Conclusion
+
+Version courte : l'apprentissage machine et l'intelligence artificielle, c'est pour les grandes personnes. 
+
+Version plus longue: S'il est très facile d'attraper un algorithme sur étagère et de l'appliquer à un jeu de données (quelques lignes de R), le faire intelligemment est beaucoup plus difficile. Cela demande une bonne compréhension de la provenance des données, des méthodes sous-jacentes aux algorithmes, ... 
+
+Si vous souhaitez explorer la dimension "prédiction" plus avant, vous pourrez choisir cette spécialisation pour la dernière séquence de développement.
+
+
+
+
+
   

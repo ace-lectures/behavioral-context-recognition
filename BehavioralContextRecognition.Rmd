@@ -1,0 +1,488 @@
+---
+title: 'Introduction à la reconnaissance de contexte '
+output:
+  pdf_document: default
+  html_notebook: default
+---
+
+```{r warning=FALSE, error=FALSE, echo=FALSE}
+suppressPackageStartupMessages(library(plyr))
+suppressPackageStartupMessages(library(readr))
+suppressPackageStartupMessages(library(tidyverse))
+suppressPackageStartupMessages(library(knitr))
+suppressPackageStartupMessages(library(devtools))
+suppressPackageStartupMessages(library(formattable))
+if (!requireNamespace("ComplexHeatmap", quietly=TRUE))
+  install_github("jokergoo/ComplexHeatmap")
+suppressPackageStartupMessages(library(ComplexHeatmap))
+```
+
+  - Auteur : Sébastien Mosser
+  - Version : 06.2020
+
+Cette étude de cas est fortement inspiré des chapitres 3, 5 et 7 du livre _Machine Learning with R_ de Brent Lenz (éditions PACKT Publishing). Elle a bénéficié des conseils des professeur•e•s Marie-Jean Meurs (informatique) et Arthur Charpentier (mathématiques), qui donnent le cours d'Initiation à la science des données et à l'intelligence artificielle (INF7100).
+
+# Analyse du jeux de données
+
+```{r echo=FALSE}
+load_complete_dataset <- function() {
+  files_path <- file.path("_datasets", "ExtraSensory", 
+                          fsep = .Platform$file.sep)
+  files <- list.files(path=files_path, pattern="*.csv", 
+                      full.names=TRUE)
+  ldply(files, read_csv)
+}
+```
+
+```{r, warning=FALSE, message=FALSE}
+dataset <- load_complete_dataset()
+```
+
+
+
+  - Le jeux de données `dataset` contient `r prettyNum(nrow(dataset), big.mark=",")` observations sur `r length(dataset)` variables.
+
+```{r}
+labels <- dataset %>% select(starts_with("label:"))
+```
+
+
+- Parmi ces variables, `r length(labels)` sont des étiquettes de reconnaissance de contexte
+
+```{r}
+plot_labels_count <- function (data) {
+  transposed <- rownames_to_column(data.frame(t(data)))
+  names(transposed) <- c("variable", "n")
+  ggplot(data=transposed, mapping=aes(x=variable, y=n)) + 
+    geom_bar(stat = "identity") +
+    coord_flip() 
+}
+plot_labels_count(data.frame(as.list(colSums(labels, na.rm = TRUE))))
+```
+
+
+
+# Détection du Contexte d'utilisation du téléphone
+
+```{r}
+phone_labels <- labels %>% select(starts_with("label:PHONE_"))
+phone_labels <- phone_labels[complete.cases(phone_labels),]
+```
+
+On s'interesse ici uniquement aux observations de la localisation du téléphone de l'utilisateur. On dispose de `r prettyNum(nrow(phone_labels),big.mark=",")` observations. Dans un premier temps, on vérifie que toutes les observations sont bien disjointes.
+
+```{r}
+phone_labels_cases <- list(
+  "bag"    = rownames(phone_labels[phone_labels$'label:PHONE_IN_BAG' == 1,]),
+  "hand"   = rownames(phone_labels[phone_labels$'label:PHONE_IN_HAND' == 1,]),
+  "pocket" = rownames(phone_labels[phone_labels$'label:PHONE_IN_POCKET' == 1,]),
+  "table"  = rownames(phone_labels[phone_labels$'label:PHONE_ON_TABLE' == 1,])
+)
+phone_labels_matrix = make_comb_mat(phone_labels_cases)
+```
+
+```{r echo=FALSE}
+UpSet(phone_labels_matrix, 
+      set_order = order(set_size(phone_labels_matrix)),
+      row_title = "|observation|",
+      right_annotation = upset_right_annotation(phone_labels_matrix, ylim = c(0, 70000)),
+      top_annotation = upset_top_annotation(phone_labels_matrix, ylim=c(0,70000)))
+```
+
+## Fabrication du jeu de données initial
+
+### Récupération des données d'intêret
+
+On va maintenant fabriquer le jeu de données qui va nous permettre de faire l'experience de classification. On va réduire le jeu de données initial aux valeurs pour l'accéléromètre, le gyroscope et le magnétomètre.
+  
+```{r}
+phone_observations <- dataset %>% select(starts_with("raw_acc"),
+                                         starts_with("proc_gyro"),
+                                         starts_with("raw_magnet"),
+                                         starts_with("label:PHONE_"))
+phone_observations <- phone_observations[complete.cases(phone_observations),]
+```
+
+En restreignant uniquement aux cas où nous disposons de toutes les valeurs pour chaque observations, cela donne `r prettyNum(nrow(phone_observations), big.marg=",")` observations. 
+
+Plutot que $4$ colonnes indiquant $0$ ou $1$ pour chaque classe, les algorithmes d'apprentissage attendent une colonne contenant directement la classe qui nous interesse (sous la forme d'un _facteur_).
+
+```{r}
+phone_observations$STATUS <- "?"
+phone_observations[phone_observations$`label:PHONE_IN_BAG` == 1,]$STATUS    <- "B"
+phone_observations[phone_observations$`label:PHONE_IN_POCKET` == 1,]$STATUS <- "P"
+phone_observations[phone_observations$`label:PHONE_IN_HAND` == 1,]$STATUS   <- "H"
+phone_observations[phone_observations$`label:PHONE_ON_TABLE` == 1,]$STATUS  <- "T"
+phone_observations$STATUS <- factor(phone_observations$STATUS, 
+                                    levels = c("B", "P", "H", "T"),
+                                    labels = c("bag", "pocket", "hand", "table"))
+phone_observations <- phone_observations %>% select(-starts_with("label:PHONE_"))
+```
+
+### Normalisation des données
+
+Les donnés de chaque capteurs sont des des intervales très différents les uns des autres. 
+
+```{r}
+summary(phone_observations[c("raw_acc:3d:mean_x", "raw_acc:3d:mean_y", "raw_acc:3d:mean_z")])
+```
+
+On va donc normaliser les données, pour ramener tous les calculs sur des intervalles dans `[0,1]`. On utilise une formule classique de normalisation : 
+
+```{r}
+norm_variable <- function (v) { return ((v - min(v)) / (max(v) - min(v))) }
+```
+
+Pour fabriquer un jeux de donnée normalisée, il suffit d'appliquer cette fonction de normalisation à toutes les variables, sauf la dernière (qui est le contexte a reconnaitre).
+
+```{r}
+normalize <- function(dataset) {
+  ds_n <- as.data.frame(lapply(dataset[1:ncol(dataset)-1],
+                              norm_variable))
+  ds_n$status <- dataset$STATUS
+  return(ds_n)
+}
+
+```
+
+On peut maintenant fabriquer le jeux de donnée normalisée : 
+
+```{r}
+with(obs_n <- normalize(phone_observations),
+     summary(obs_n[c("raw_acc.3d.mean_x", "raw_acc.3d.mean_y", "raw_acc.3d.mean_z")]))
+```
+
+
+### Fabrication des jeux de données d'entrainement et de test
+
+On va entrainer notre classifieur sur 80% des données disponibles. Et on utilisera les 20% restantes pour vérifier les résultats et mesurer à quel point notre classifieur est pertinent.
+
+```{r}
+prepare_datasets <- function(complete, random.seed=42) {
+  set.seed(random.seed) # Pour rendre les experiences reproductibles
+  training <- complete %>% sample_n(size = 0.8*nrow(complete))
+  test     <- setdiff(complete, training)
+  list(train = training, test = test)
+}
+```
+
+## Fabrication d'une première prédiction et évaluation des résultats
+
+```{r}
+library(class)
+library(caret)
+
+run_knn <- function(training, test, k.value=42) {
+  # Preparing the datasets for training 
+  training_data <- training %>% select(-status)
+  training_classes <- training %>% select(status)
+  # Same, for testing
+  test_data <- test %>% select(-status)
+  test_classes <- test %>% select(status)
+  # Running the classifier
+  predictions <- knn(train = training_data,
+                     test  = test_data,
+                     cl    = training_classes[,1],
+                     k     = k.value)
+  # Building the confusion matrix
+  cmat <- confusionMatrix(reference = test_classes[,1], 
+                          data = predictions)
+  return(cmat)
+}
+```
+
+### Application des _n-plus proches voisins_ à notre jeux de données
+
+```{r}
+cmat <- with(ds <- prepare_datasets(normalize(phone_observations)),
+             run_knn(ds$train, ds$test))
+```
+
+Conclusion : En appliquant naivement la méthode des plus proches voisins à notre jeux de données normalisé, on obtient une _accuracy_ de `r percent(cmat$overall["Accuracy"])` ! **C'est vraiment bien pratique l'apprentissage automatique !**
+
+### Regardons un peu plus en détails les résultats
+
+```{r}
+library(graphics)
+plot_confusion_matrix <- function(mat, title) {
+  mosaicplot(mat, 
+             xlab = "", ylab = "", 
+             main = title,
+             shade = TRUE)
+}
+  plot_confusion_matrix(cmat$table, "kNN, version 1")
+```
+On va regarder un peu plus dans le détails pour chaque classe ce qu'il en est, en s'interessant à la précision, au rappel, et à la F-mesure.
+
+  - Précision : nombre de contexte reconnus rapporté sur le nombre total de contextes;
+  - Rappel : nombre de contextes reconnus qui sont pertinents;
+  - F-Mesure : Moyenne harmonique de la prévision et du rappel. 
+
+```{r}
+print_stats <- function(mat) {
+  values <- data.frame(mat$byClass)
+  kable(values %>% 
+          select(contains("Accuracy"), Precision, Recall, F1), 
+        digits = 2)
+}
+print_stats(cmat)
+```
+Un predicteur idéal aurait une précision (_precision_) et un rappel (_recall_)  valant 1 (et donc idem pour sa F-mesure) : on trouve tous les contextes, et on ne se trompe jamais. 
+
+Dans notre cas, on a une forte _accuracy_ (~80%), mais une précision complètement déraisonnable. On voit aussi une sur-représentation des contextes `table`.
+
+### Effet de la sur-représentation d'une classe
+
+On va fabriquer un prédicteur encore plus naif : il répond toujours `table`.
+
+```{r, warning=FALSE}
+constant_table <- function(training, test) {
+  test_classes <- test %>% select(status)
+  # On répond toujours table ... facile !
+  predictions <- as.factor(rep('table',nrow(test)))
+  cmat <- confusionMatrix(reference = test_classes[,1], 
+                          data = predictions)
+  return(cmat)
+}
+cmat_constant <- with(ds <- prepare_datasets(normalize(phone_observations)),
+                      constant_table(ds$train, ds$test))
+```
+
+On obtient avec cette prédiction une _accuracy_ de `r percent(cmat_constant$overall["Accuracy"])` !! Il est important de garder à l'esprit que, prise seule, l'_accuracy_ ne veut pas dire grand chose.
+
+```{r}
+plot_confusion_matrix(cmat_constant$table, "Constant classifier")
+print_stats(cmat_constant)
+```
+
+# Nettoyage des données disponibles
+
+## Équilibrage du jeux de données
+
+On commence par regarder dans quel état est notre sur-représentation de la class `table`.
+
+```{r}
+summary(phone_observations$STATUS)
+```
+
+On a environ $6,000$ enregistrements pour les trois autres classes, mais $42,000$ pour la classe `table`.
+
+On va fabriquer un jeu de données équilibré en retenant uniquement $6,000$ observations pour la classe `table`.
+
+```{r}
+balance <- function(dataset, random.seed=42) {
+  set.seed(random.seed)
+  res <- dataset[dataset$STATUS == 'bag',]
+  res <- rbind(res, dataset[dataset$STATUS == 'pocket',])
+  res <- rbind(res, dataset[dataset$STATUS == 'hand',])
+  res <- rbind(res, sample_n(dataset[dataset$STATUS == 'table',], 6000))
+  return(res)
+}
+summary(balance(phone_observations)$STATUS)
+```
+
+## Fabrication d'une prédiction sur le modèle équilibré
+
+```{r}
+cmat_balanced <- 
+  with(ds <- prepare_datasets(normalize(balance(phone_observations))),
+                      run_knn(ds$train, ds$test))
+```
+
+On obtient avec cette prédiction une _accuracy_ de `r percent(cmat_balanced$overall["Accuracy"])`, C'est moins bien qu'avant ! (vraiment ?)
+
+```{r}
+plot_confusion_matrix(cmat_balanced$table, "knn, balanced dataset")
+print_stats(cmat_balanced)
+```
+
+Les résultats ne sont pas fantastique, mais par contre on commence a faire remonter le rappel,et a avoir des detection a peu près équivalente en fonction des differentes classes. 
+
+## Une autre approche de la normalisation (Z-score)
+
+La normalisation dans [0,1] avec notre formule "naive" a pour effet de bord d'écraser des valeurs extrêmes, ce qui les a rapprochées trop naivement de leurs voisines. On peut utiliser une méthode alternative (_z-score_), qui n'a ni minimum ni maximum prédéfinis.
+
+```{r}
+z_normalize <- function(dataset) {
+  ds_n <- as.data.frame(scale(dataset[1:ncol(dataset)-1]))
+  ds_n$status <- dataset$STATUS
+  return(ds_n)
+}
+```
+
+On peut maintenant relancer une prédiction en utilisant cette normalisation plutôt que notre version naive initiale.
+
+```{r}
+cmat_z <- 
+  with(ds <- prepare_datasets(z_normalize(balance(phone_observations))),
+                      run_knn(ds$train, ds$test))
+```
+
+On obtient avec cette prédiction une _accuracy_ de `r percent(cmat_z$overall["Accuracy"])`. On remonte. Mais est-ce vraiment mieux ?
+
+```{r}
+plot_confusion_matrix(cmat_z$table, "kNN, Z-Score normalization")
+print_stats(cmat_z)
+```
+
+On s'améliore, la précision et le rappel (et donc la F-mesure) augmentent.
+
+## Taille de l'espace des données 
+
+Un des principes de l'apprentissage machine est d'apprendre sur des données d'entraînement, et on ne s'est jamais vraiment intéréssé aux données que l'on manipule jusqu'à présent !
+
+Notre jeux de données équilibré contient `r nrow(balance(phone_observations))`, pour `ncol(phone_observations)-1` variables. Vu la taille de l'espace, la méthode des k-plus proches voisins pose problème : l'espace est tellement grand qu'il est très facile d'être le voisin de quelqu'un !
+
+### État des lieux de la corrélation entre variables
+
+```{r}
+library(corrplot)
+print_corplot <- function(dataset) {
+  corr_obs <- dataset %>% select(-STATUS)
+  colnames(corr_obs) <- 1:ncol(corr_obs)
+  corr_matrix <- cor(corr_obs)
+  corrplot(corr_matrix, type = "upper", 
+           tl.col = "black", tl.srt = 45, tl.cex=0.5)
+}
+print_corplot(phone_observations)
+```
+
+En affichant cette matrice de corrélation, on se rend compte que beaucoup de variables sont corélées entre elles.
+
+On va maintenant netoyer nos observations, pour garder uniquement les variables avec un seuil de corélation inférieur à 80%.
+
+
+```{r}
+slice_relevant <- function(dataset, threshold = 0.8) {
+  corr_obs <- dataset %>% select(-STATUS)
+  corr_matrix <- cor(corr_obs)
+  high <- findCorrelation(corr_matrix, cutoff = threshold)
+  res <- phone_observations[,-c(high)]
+  res$STATUS <- phone_observations$STATUS
+  return(res)
+}
+print_corplot(slice_relevant(phone_observations))
+```
+
+Avec cette approche, on réduit l'espace des données de $`r ncol(phone_observations) - ncol(slice_relevant(phone_observations))`$ dimensions. Cela va accélerer drastiquement le temps d'entrainement de notre prédicteur.
+
+### Prédiction sur les données épurées
+
+```{r}
+cmat_sliced <- 
+  with(ds <- prepare_datasets(z_normalize(balance(slice_relevant(phone_observations)))),
+                      run_knn(ds$train, ds$test))
+```
+
+On obtient avec cette prédiction une _accuracy_ de `r percent(cmat_sliced$overall["Accuracy"])`. On est équivalent a la prédiction précédente, mais on va _beaucoup_ plus vite pour l'entrainement. Qu'en est-il des autres dimensions ?
+
+```{r}
+plot_confusion_matrix(cmat_sliced$table, "kNN, Sliced dataset")
+print_stats(cmat_sliced)
+```
+Ceci étant dit, on commence a sentir les limites de la naiveté de notre approche ...
+
+# Utilisation d'un arbre de décision
+
+La méthode des plus proche voisins est simple, mais a pour inconvénient d'être très fragile aux variables bruitées et à la taille des jeux de données. De plus, elle demande enormément de puissance de calcul.
+
+On va s'interesser ici à la mise en place d'un arbre de décision, en utilisant l'algorithme `C5.0`.
+
+```{r}
+library(C50)
+
+run_dt <- function(training, test, nb.trials=1) {
+  training_data <- training %>% select(-status)
+  training_classes <- training %>% select(status)
+  test_data <- test %>% select(-status)
+  test_classes <- test %>% select(status)
+  model <- C5.0(training_data,
+                training_classes[,1],
+                trials = nb.trials)
+  predictions <- predict(model, test_data, type = "class")
+  cmat <- confusionMatrix(reference = test_classes[,1], 
+                          data = predictions)
+  return(list(cmat=cmat, tree=model))
+}
+```
+
+## Fabrication d'une prediction avec arbre de décision
+
+```{r}
+dt_result <- 
+  with(ds <- prepare_datasets(z_normalize(balance(slice_relevant(phone_observations)))),
+                      run_dt(ds$train, ds$test))
+```
+
+On obtient avec cette prédiction une _accuracy_ de `r percent(dt_result$cmat$overall["Accuracy"])`. 
+
+```{r}
+plot_confusion_matrix(dt_result$cmat$table, "Decision tree")
+print_stats(dt_result$cmat)
+```
+On devient bien meilleur !
+
+## Utilisation de l'_adaptive boosting_ pour améliorer le modèle
+
+La technique d'_adaptive boosting_ est un _méta_-algorithme, c.à.d un algorithme qui fonctionne au niveau d'autres algorithmes. Le principe sous-jacent à cette technique est de fabriquer non pas un seula rbre de décision, mais d'en fabriquer $n$. Pour chaque exemple, chaque arbre va faire une proposition de classification, et les arbres éliront la réponse qui semble la meilleure par un vote en fonction de leurs prédictions.
+
+```{r}
+boost_result <- 
+  with(ds <- prepare_datasets(z_normalize(balance(slice_relevant(phone_observations)))),
+                      run_dt(ds$train, ds$test, nb.trials=10))
+```
+
+On obtient avec cette prédiction une _accuracy_ de `r percent(boost_result$cmat$overall["Accuracy"])`. 
+
+```{r}
+plot_confusion_matrix(boost_result$cmat$table, "Boosted Decision tree")
+print_stats(boost_result$cmat)
+```
+
+## Méta-analyse
+
+On regarde ici l'évolution des performances de nos prédicteurs.
+
+## Evolution globale de l'_accuracy_
+
+## Évolution des différentes métriques par classe
+
+On commence par rassembler toutes les données d'interêt (les matrices de confusion des différentes étapes) dans un même jeux de données.
+
+```{r}
+build_frame <- function(mat, stepName) {
+  values <- rownames_to_column(data.frame(mat$byClass),"class") %>% 
+    select(contains("Accuracy"), Precision, Recall, F1, contains("Class"))
+  values[values$class == 'Class: bag',]$class <- 'bag'
+  values[values$class == 'Class: pocket',]$class <- 'pocket'
+  values[values$class == 'Class: hand',]$class <- 'hand'
+  values[values$class == 'Class: table',]$class <- 'table'
+  values$step <- stepName
+  return(values)
+}
+
+build_global_frames <- function() {
+  tmp <- 
+  rbind.fill(build_frame(cmat, "1_kNN"),
+             build_frame(cmat_balanced, "2_bal"),
+             build_frame(cmat_z, "3_zsc"),
+             build_frame(cmat_sliced, "4_sli"),
+             build_frame(dt_result$cmat, "5_dtr"),
+             build_frame(boost_result$cmat, "6_boo")
+             )
+  tmp$class <- as.factor(tmp$class)
+  tmp$step  <- as.factor(tmp$step) 
+  return(tmp)
+}
+cmats <-  build_global_frames()
+kable(cmats, digits=2)
+```
+
+
+## Conclusion
+
+Version courte : l'apprentissage machine et l'intelligence artificielle, c'est pour les grandes personnes. Il existe des cours au département (p.ex, INF4230, INF5081, INF7100) si vous voulez allez plus loin sur le sujet. Il est aussi possible de faire un projet de recherche crédité avec un prof (INF6200).
+
+Version plus longue: S'il est très facile d'attraper un algorithme sur étagère et de l'appliquer à un jeu de données (quelques lignes de R), le faire intelligemment est beaucoup plus difficile. Cela demande une bonne compréhension de la provenance des données, des méthodes sous-jacentes aux algorithmes, ... 
+
+Si vous souhaitez explorer la dimension "prédiction" plus avant, vous pourrez choisir cette spécialisation pour la dernière séquence de développement.
